@@ -1567,7 +1567,7 @@ async def _call_and_get_cooldowns(router, model):
             messages=[{"role": "user", "content": "hi"}],
             mock_response="litellm.RateLimitError",
         )
-    return await async_get_cooldown_deployments(litellm_router_instance=router, parent_otel_span=None)
+    return await async_get_cooldown_deployments(ctx=router._core_ctx, parent_otel_span=None)
 
 
 @pytest.mark.asyncio
