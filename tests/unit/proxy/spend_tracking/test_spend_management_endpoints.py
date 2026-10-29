@@ -8013,8 +8013,9 @@ async def test_ui_view_spend_logs_group_by_session_status_inlines_the_window(cli
         )
         assert response.status_code == 200, response.text
         read = next(call for call in mock_prisma.db.query_raw.await_args_list if "rows_scanned" in call.args[0])
-        outer, outcomes = read.args[0].split("SELECT DISTINCT ON", 1)
-        outcomes = outcomes.split("AS session_outcomes", 1)[0]
+        before, outcomes = read.args[0].split("SELECT DISTINCT ON", 1)
+        outcomes, after = outcomes.split("AS session_outcomes", 1)
+        outer = before + after
         for bound in (start_date, end_date):
             literal = datetime.datetime.strptime(bound, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).isoformat()
             assert f"('{literal}'::timestamptz AT TIME ZONE 'UTC')" in outcomes
@@ -8024,6 +8025,92 @@ async def test_ui_view_spend_logs_group_by_session_status_inlines_the_window(cli
             datetime.datetime.strptime(bound, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             for bound in (start_date, end_date)
         )
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_filter", ["failure", "success"])
+async def test_ui_view_spend_logs_group_by_session_materializes_only_failed_sessions(
+    client, monkeypatch, status_filter
+):
+    """A failure filter's sessions are read once as a MATERIALIZED CTE (inlined, each parallel worker re-sorts the window); success stays inlined."""
+    page_rows = [_session_page_row("sess-1", "2026-08-29 08:00:00")]
+    mock_prisma = _session_grouped_mock_prisma(page_rows, 1, [_session_representative_row("req-1", "sess-1")])
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
+    monkeypatch.setattr(
+        "litellm.proxy.spend_tracking.spend_management_endpoints._is_admin_view_safe",
+        lambda user_api_key_dict: True,
+    )
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin_user"
+    )
+    try:
+        start_date, end_date = _default_date_range()
+        response = client.get(
+            "/spend/logs/ui",
+            params={
+                "start_date": start_date,
+                "end_date": end_date,
+                "group_by_session": "true",
+                "status_filter": status_filter,
+                "model": "gpt-4o",
+                "session_cursor": "2026-08-29 09:00:00|hashed-key|req-solo",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert response.status_code == 200, response.text
+        assert [row["session_id"] for row in response.json()["data"]] == ["sess-1"]
+        reads = [call.args for call in mock_prisma.db.query_raw.await_args_list if "rows_scanned" in call.args[0]]
+        assert len(reads) == 2, "the cursor page's read and the window count both carry the status filter"
+        for read in reads:
+            assert read[0].count("AS session_outcomes") == 1
+            assert "COALESCE(status, 'success') = $4" in read[0] and read[4] == status_filter
+            if status_filter == "failure":
+                assert read[0].lstrip().startswith("WITH status_sessions AS MATERIALIZED (")
+                assert "IN (SELECT session_key, api_key FROM status_sessions)" in read[0]
+            else:
+                assert "status_sessions" not in read[0]
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+
+@pytest.mark.asyncio
+async def test_ui_view_spend_logs_group_by_session_failure_off_the_session_page_stays_inlined(client, monkeypatch):
+    """Only the session page declares the status_sessions CTE, so other grouped sorts keep the inlined failure subquery."""
+    queries = []
+
+    async def mock_query_raw(sql_query, *params):
+        queries.append(sql_query)
+        return [{"total_count": 0}] if "total_count" in sql_query else []
+
+    mock_prisma = MagicMock()
+    mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(side_effect=mock_query_raw)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
+    monkeypatch.setattr(
+        "litellm.proxy.spend_tracking.spend_management_endpoints._is_admin_view_safe",
+        lambda user_api_key_dict: True,
+    )
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin_user"
+    )
+    try:
+        start_date, end_date = _default_date_range()
+        response = client.get(
+            "/spend/logs/ui",
+            params={
+                "start_date": start_date,
+                "end_date": end_date,
+                "group_by_session": "true",
+                "status_filter": "failure",
+                "sort_by": "spend",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert response.status_code == 200, response.text
+        assert queries and all("status_sessions" not in query for query in queries)
+        assert any("AS session_outcomes" in query for query in queries)
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
 

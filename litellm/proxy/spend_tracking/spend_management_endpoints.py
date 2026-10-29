@@ -2950,16 +2950,26 @@ async def ui_view_spend_logs(
             sql_params.append(json.dumps(used_client_oauth_token))
             p += 1
 
-        if status_filter is not None and group_by_session is True and not is_search_lookup:
-            # The window goes in as literals (parse_date's UTC datetimes, checked by
-            # _utc_timestamp_literal). Prisma reuses its prepared statements, and from the 6th
-            # run Postgres plans a $N window as 0.5% of the table, then probes every
-            # session by api_key: ~2 min instead of ~2.5 s over 700k rows.
-            session_filter_conditions: Final = (
-                " AND ".join([*window_literal_conditions, *sql_conditions[len(window_literal_conditions) :]]) or "TRUE"
-            )
-            sql_conditions.append(
-                f"""({_SESSION_GROUP_KEY_SQL}) IN (
+        session_page_route: Final = (
+            group_by_session is True
+            and not is_v2
+            and not is_request_id_lookup
+            and not is_search_lookup
+            and sort_by == "startTime"
+        )
+        # The session page reads a failure filter's sessions once, as a MATERIALIZED CTE: inlined in the read,
+        # each parallel worker re-sorts the whole window for it (3x the blocks and temp on 2M rows). A success
+        # filter keeps most sessions, and there the inlined form is faster.
+        materialize_status_sessions: Final = session_page_route and status_filter == "failure"
+        # The window goes in as literals (parse_date's UTC datetimes, checked by
+        # _utc_timestamp_literal). Prisma reuses its prepared statements, and from the 6th
+        # run Postgres plans a $N window as 0.5% of the table, then probes every
+        # session by api_key: ~2 min instead of ~2.5 s over 700k rows.
+        session_filter_conditions: Final = (
+            " AND ".join([*window_literal_conditions, *sql_conditions[len(window_literal_conditions) :]]) or "TRUE"
+        )
+        status_sessions_sql: Final = (
+            f"""
                     SELECT session_key, api_key FROM (
                         SELECT DISTINCT ON ({_SESSION_GROUP_KEY_SQL})
                             {_SESSION_KEY_EXPR} AS session_key, api_key, status
@@ -2968,18 +2978,20 @@ async def ui_view_spend_logs(
                         ORDER BY {_SESSION_GROUP_KEY_SQL}, {_SESSION_REPRESENTATIVE_ORDER_SQL}
                     ) AS session_outcomes
                     WHERE COALESCE(status, 'success') = ${p}
-                )"""
+                """
+            if status_filter is not None and group_by_session is True and not is_search_lookup
+            else None
+        )
+        if status_sessions_sql is not None:
+            sql_conditions.append(
+                f"({_SESSION_GROUP_KEY_SQL}) IN (SELECT session_key, api_key FROM status_sessions)"
+                if materialize_status_sessions
+                else f"({_SESSION_GROUP_KEY_SQL}) IN ({status_sessions_sql})"
             )
             sql_params.append(status_filter)
             p += 1
 
-        if (
-            group_by_session is True
-            and not is_v2
-            and not is_request_id_lookup
-            and not is_search_lookup
-            and sort_by == "startTime"
-        ):
+        if session_page_route:
             return await _ui_session_grouped_spend_logs(
                 prisma_client=prisma_client,
                 sql_conditions=sql_conditions,
@@ -2990,6 +3002,7 @@ async def ui_view_spend_logs(
                 sort_desc=order_direction != "asc",
                 session_cursor=session_cursor,
                 status_filtered=status_filter is not None and not is_search_lookup,
+                status_sessions_sql=status_sessions_sql if materialize_status_sessions else None,
             )
 
         # Build the ORDER BY expression. ttft_ms is computed from
@@ -3197,6 +3210,7 @@ async def _ui_session_grouped_spend_logs(
     sort_desc: bool,
     session_cursor: str | None,
     status_filtered: bool = False,
+    status_sessions_sql: str | None = None,
 ) -> Mapping[str, object]:
     """
     One row per session, keyset-paginated by session last activity.
@@ -3231,6 +3245,10 @@ async def _ui_session_grouped_spend_logs(
     row_where_clause: Final = " AND ".join(row_conditions) if row_conditions else "TRUE"
     cmp_op: Final = "<" if sort_desc else ">"
     direction: Final = "DESC" if sort_desc else "ASC"
+    # ``status_sessions_sql`` (a failure filter's sessions, which the last condition reads) is computed once per read.
+    status_cte: Final = (
+        f"status_sessions AS MATERIALIZED ({status_sessions_sql})," if status_sessions_sql is not None else ""
+    )
 
     cursor: Final = _parse_session_cursor(session_cursor)
     cursor_clause: Final = (
@@ -3298,7 +3316,7 @@ async def _ui_session_grouped_spend_logs(
         )
         carried_keys: str = f"${carry_index}::text[], ${carry_index + 1}::text[]"
         page_query: str = f"""
-            WITH scanned AS MATERIALIZED (
+            WITH {status_cte} scanned AS MATERIALIZED (
                 {_newest_session_rows_sql(where_clause, read_rows, not_after)}
             ),
             sessions AS (
@@ -3376,7 +3394,7 @@ async def _ui_session_grouped_spend_logs(
             if _read_falls_short(count_rows, session_count, rows_read, cap + 1):
                 continue
             count_query: str = f"""
-                WITH scanned AS MATERIALIZED ({_newest_session_rows_sql(where_clause, count_rows, None)})
+                WITH {status_cte} scanned AS MATERIALIZED ({_newest_session_rows_sql(where_clause, count_rows, None)})
                 SELECT COUNT(*) AS rows_scanned,
                        (SELECT COUNT(*) FROM (SELECT 1 FROM scanned GROUP BY session_key, api_key) AS s)
                        AS session_count
