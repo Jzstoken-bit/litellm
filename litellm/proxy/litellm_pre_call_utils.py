@@ -112,6 +112,7 @@ _EXPLICIT_SESSION_HEADERS: Final = frozenset({"x-litellm-trace-id", "x-litellm-s
 # ``session-id``/``thread-id``; builds before the codex-api split sent
 # ``session_id``/``conversation_id``. Ordered session before thread.
 _CODEX_SESSION_ID_HEADERS: Final = ("session-id", "session_id", "thread-id", "conversation_id")
+_BEDROCK_SESSION_ID_METADATA_KEYS: Final = ("sessionId", "threadId", "conversationId")
 # Session-id values must be non-empty strings of alphanumerics, hyphens, or underscores
 # (covers UUIDs and most common session-id formats).
 _SESSION_ID_VALUE_RE: Final = re.compile(r"^[a-zA-Z0-9_\-]{8,}$")
@@ -1025,6 +1026,23 @@ def _get_anthropic_session_id_from_metadata(metadata: object) -> str | None:
     return session_id
 
 
+def _get_bedrock_session_id_from_request_metadata(
+    normalized_headers: Mapping[str, str], request_body: Mapping[str, object]
+) -> str | None:
+    """Read the conversation id a Bedrock SDK client tags its calls with: Converse's ``requestMetadata``
+    body field or InvokeModel's ``X-Amzn-Bedrock-Request-Metadata`` JSON header. Only the Bedrock
+    pass-through route nests the client's body under ``data``."""
+    bedrock_body: Final = request_body.get("data")
+    if request_body.get("custom_llm_provider") != "bedrock" or not isinstance(bedrock_body, Mapping):
+        return None
+    header: Final = normalized_headers.get("x-amzn-bedrock-request-metadata")
+    tags: Final = _request_fields(
+        _request_fields(bedrock_body).get("requestMetadata") or (safe_json_loads(header) if header else None)
+    )
+    values: Final = (tags.get(key) for key in _BEDROCK_SESSION_ID_METADATA_KEYS)
+    return next((value for value in values if isinstance(value, str) and _SESSION_ID_VALUE_RE.fullmatch(value)), None)
+
+
 def _is_llm_inference_route(request: Request) -> bool:
     route: Final = get_request_route(request)
     return RouteChecks.is_llm_api_route(route=route) and not RouteChecks.check_route_access(
@@ -1936,6 +1954,13 @@ class LiteLLMProxyRequestSetup:
                 if isinstance(body_metadata, dict) and isinstance(body_metadata.get("user_id"), dict):
                     body_metadata["user_id"] = session_id
                 verbose_proxy_logger.debug("Extracted session_id from Anthropic metadata.user_id")
+
+        if "litellm_session_id" not in data:
+            bedrock_session_id: Final = _get_bedrock_session_id_from_request_metadata(normalized_headers, request_body)
+            if bedrock_session_id:
+                metadata_from_headers["session_id"] = bedrock_session_id
+                data["litellm_session_id"] = bedrock_session_id  # rebind-ok: data is an out-param
+                verbose_proxy_logger.debug("Extracted session_id from Bedrock request metadata")
 
         # Last-resort fallback: the W3C standards for trace/session propagation
         # (https://www.w3.org/TR/trace-context/, https://www.w3.org/TR/baggage/).
